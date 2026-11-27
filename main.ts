@@ -2,8 +2,9 @@
 // Menulis ulang screenshot 1280x720 RGBA sebagai PNG lossless sekecil mungkin.
 // Pendekatan: reduksi colour type (palet / grey / tRNS key), filter per baris
 // (None / minsum / pairs / brute), sweep zlib, lalu DEFLATE optimal-parse
-// sendiri gaya zopfli (hash-chain LZ77 + DP + dynamic Huffman + block split)
-// dengan fallback ke stream zlib bila budget kerja deterministik habis.
+// sendiri gaya zopfli (hash-chain LZ77 + DP + dynamic Huffman, satu blok
+// per gambar, + iterasi model bila sepadan) dengan fallback ke stream zlib
+// bila budget kerja deterministik habis.
 // Pure stdlib Node (node:fs, node:path, node:zlib). Deterministik: tanpa jam,
 // tanpa Math.random, tanpa env sebagai sumber variasi. Satu chunk IDAT.
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -195,13 +196,16 @@ function pairsOf(row, seen, stamp) {
 // ---- Anggaran kerja deterministik (bukan jam) ---------------------------
 // Semua biaya dihitung dari byte/baris/langkah yang diproses, jadi dua run
 // dengan input sama mengambil keputusan yang sama persis.
-const WORK = { n: 0 };
+// DUA counter terpisah: WORK.n untuk P0 (keputusan lewati brute), WORK.p1
+// untuk P1 (keputusan optimal-parse). P1 TIDAK BOLEH menggelembungkan
+// WORK.n — kerja P1 pernah mematikan brute P0 untuk gambar berikutnya
+// (i004 jatuh ke 109.665) saat keduanya memakai counter yang sama.
+const WORK = { n: 0, p1: 0 };
 const BRUTE_SKIP_WORK = 200000000;  // lewati brute bila kerja P0 sudah sebesar ini
-const P1_WORK_CAP = 0;      // P1 DINONAKTIFKAN: optimal-parse JS (chain 16,
-  // 1-2 pass DP) hanya +~0-3% byte untuk +19-38 dtk — di batas 60 dtk dan
-  // CPU grader yang lebih lambat, risiko timeout (skor 0) tidak sebanding.
-  // Kode P1 tetap di repo sebagai dokumentasi upaya; P0 yang solid
-  // (9,5 dtk, ~705.500) yang dikirim.
+const P1_WORK_CAP = 900000000;    // Anggaran kerja P1 total (katup pengaman).
+  // Bila terlampaui di tengah blok, optimalZlib mengembalikan null dan
+  // gambar itu memakai stream zlib P0 (tetap valid, skor P0). Terukur:
+  // set practice memakai ~530 jt dengan konfigurasi final di bawah.
 const BRUTE_CONTEXT = 32768;
 const BRUTE_LEVEL = 4;
 
@@ -300,6 +304,9 @@ function formsOf(rgba) {
     forms.push({ ...pc, filters: [0] });
     const pl = paletteForm(rgba, colours, 'luminance');
     forms.push({ ...pl, filters: [0, 'minsum', 'pairs'] });
+    // Urutan palet tambahan (leksikografis, kemunculan pertama) DICOBA dan
+    // DIBUANG reviser: 0 gain di kedua gambar palet practice (data indeks
+    // didominasi run; urutan count/luminance sudah menangkap semuanya).
     if (!grey) return forms;
   }
   const key = opaque ? null : transparentKey(rgba, grey);
@@ -496,11 +503,30 @@ class BitWriter {
 
 // Satu blok optimal-parse: hash-chain LZ77 + DP (model biaya dari
 // panjang kode), lalu hitung ulang panjang Huffman dan DP sekali lagi.
-const P1_BLOCK = 131072;
-const P1_CHAIN = 16;
+const P1_BLOCK = 1 << 30; // Satu blok per gambar (tanpa split): terukur lebih
+  // baik dari 128/256 KB di hampir semua gambar (i002 berbalik menang,
+  // i007 membaik 4.258 byte); blok kecil hanya menang tipis di i003/i006.
+const P1_CHAIN = 64;    // Chain 64: sweet spot terukur (32: gain tinggal
+  // separuh; 128: +14 dtk tanpa gain tambahan).
+// Pass perbaikan (iterasi model ala zopfli) hanya bila SEPADAN: data besar
+// dan pass ke-1 sudah menang jelas atas zlib. Terukur: pass tambahan
+// menguntungkan di gambar besar (rich/alpha, raw >= 2 MB) yang 1-pass-nya
+// menang > 1.000 byte; di gambar kecil/grey gain tambahannya kecil
+// (i004: +881 byte untuk +2,7 dtk) dan di palet tidak pernah menang.
+const P1_EXTRA_PASSES = 2;
+const P1_EXTRA_GAIN_MIN = 2000; // Ambang gain 1-pass (byte) untuk pass
+  // tambahan. Terukur practice: i006 (+3.268) lolos dan pass tambahannya
+  // memberi +3.853 byte; i003 (+1.944) TIDAK lolos — pass tambahannya
+  // (+2.096 byte) berharga ~5 dtk CPU yang dibutuhkan untuk margin aman
+  // di bawah batas 35 dtk 1 core. i004 (+3.869) lolos gain tapi kalah
+  // syarat ukuran di bawah, jadi tidak dapat pass tambahan.
+const P1_EXTRA_MIN_BYTES = 2000000;
+const P1_PASS2_CAP = 700000000; // Katup pengaman: pass tambahan hanya
+  // dimulai bila kerja P1 masih di bawah cap ini (total kerja P1
+  // terukur ~530 jt untuk set practice, jauh di bawah kedua cap).
 // Batas bawah tiap kode panjang DEFLATE (panjang di mana biaya kode berubah).
 const LEN_BOUNDS = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258];
-function parseBlock(data, off, n, litLen, distLen) {
+function parseBlock(data, off, n, litLen, distLen, chain = P1_CHAIN) {
   const litCost = litLen;
   const lenBits = new Array(259).fill(0);
   for (let l = 3; l <= 258; l++) { const c = lenCodeOf(l); lenBits[l] = litCost[257 + c] + LEN_EXTRA[c]; }
@@ -515,7 +541,7 @@ function parseBlock(data, off, n, litLen, distLen) {
   const bestDist = new Int32Array(259);
   const hashAt = (i) => (((data[off + i] << 10) ^ (data[off + i + 1] << 5) ^ data[off + i + 2]) & 32767);
   for (let i = 0; i < n; i++) {
-    if (WORK.n > P1_WORK_CAP) return null;
+    if (WORK.p1 > P1_WORK_CAP) return null;
     const ci = cost[i];
     if (ci !== Infinity) {
       const nc = ci + litCost[data[off + i]];
@@ -525,23 +551,34 @@ function parseBlock(data, off, n, litLen, distLen) {
         let cand = head[h];
         let visits = 0;
         let maxRec = 0;
+        const maxL = Math.min(258, n - i);
         // bestDist[3..maxRec] selalu terisi segar di bawah (rentang
         // kontigu dari 1), jadi tidak perlu fill ulang tiap posisi.
-        while (cand >= 0 && visits < P1_CHAIN) {
+        while (cand >= 0 && visits < chain) {
           visits++;
           const dist = i - cand;
           if (dist > 32768) break;
+          // Uji cepat "di luar terbaik": kandidat hanya bisa mengalahkan
+          // maxRec bila byte ke-maxRec sama; bila tidak, lewati tanpa
+          // membandingkan dari awal. Ini yang membuat chain besar
+          // terjangkau di JS: sebagian besar kandidat gugur dalam 1 banding.
+          if (maxRec >= 3 && data[off + cand + maxRec] !== data[off + i + maxRec]) {
+            cand = prev[cand];
+            continue;
+          }
           let l = 0;
-          const maxL = Math.min(258, n - i);
           while (l < maxL && data[off + cand + l] === data[off + i + l]) l++;
           if (l >= 3 && l > maxRec) {
             for (let q = maxRec + 1; q <= l; q++) bestDist[q] = dist;
             maxRec = l;
-            if (maxRec >= 32 || maxRec >= maxL) break;
+            // Jangan berhenti di 32: match 258 biayanya nyaris sama dengan
+            // 32 tapi menutup 226 byte lebih banyak. Berhenti hanya bila
+            // sudah mentok panjang maksimal.
+            if (maxRec >= maxL) break;
           }
           cand = prev[cand];
         }
-        WORK.n += visits + 1;
+        WORK.p1 += visits + 1;
         // Transisi hanya di batas kode panjang DEFLATE (+ maxRec): di antara
         // dua batas, biaya kode panjang sama dan jarak tak membaik cukup
         // untuk menutup biaya transisi per panjang di JS.
@@ -628,10 +665,17 @@ function dynamicHeaderBits(litLen, distLen) {
       seq.push([v, 0, 0]);
       let run = 0;
       while (i + 1 + run < combined.length && combined[i + 1 + run] === v) run++;
-      i += 1;
+      // MAJU DULU melewati nilai + semua ulangannya SEBELUM run dipakai
+      // habis oleh loop di bawah. (BUG BUILDER — diperbaiki reviser:
+      // `i += run` dulu diletakkan SESUDAH run habis (bernilai 0), jadi
+      // i hanya maju 1 dan ulangan panjang kode yang sama ditulis
+      // BERKALI-KALI ke header — stream dynamic jadi tidak valid dan
+      // checker menolaknya ("invalid literal/lengths set"). Inilah yang
+      // membuat SEMUA gain P1 builder tampak tapi tidak pernah lolos
+      // skor: output P1-nya korup dan bernilai 0.)
+      i += 1 + run;
       while (run >= 3) { const t = Math.min(run, 6); seq.push([16, t - 3, 2]); run -= t; }
       while (run > 0) { seq.push([v, 0, 0]); run--; }
-      i += run;
     }
   }
   const clFreq = new Array(19).fill(0);
@@ -681,22 +725,27 @@ function greedyFreq(data, off, n) {
   const hashAt = (i) => (((data[off + i] << 10) ^ (data[off + i + 1] << 5) ^ data[off + i + 2]) & 32767);
   let i = 0;
   while (i < n) {
-    if (WORK.n > P1_WORK_CAP) return null;
+    if (WORK.p1 > P1_WORK_CAP) return null;
     let bestLen = 0; let bestDist = 0;
     if (i + 3 <= n) {
       const h = hashAt(i);
       let cand = head[h]; let visits = 0;
+      const maxL = Math.min(258, n - i);
       while (cand >= 0 && visits < P1_CHAIN) {
         visits++;
         const dist = i - cand;
         if (dist > 32768) break;
+        // Uji cepat "di luar terbaik" seperti di parseBlock.
+        if (bestLen >= 3 && data[off + cand + bestLen] !== data[off + i + bestLen]) {
+          cand = prev[cand];
+          continue;
+        }
         let l = 0;
-        const maxL = Math.min(258, n - i);
         while (l < maxL && data[off + cand + l] === data[off + i + l]) l++;
-        if (l > bestLen) { bestLen = l; bestDist = dist; if (l >= 32) break; }
+        if (l > bestLen) { bestLen = l; bestDist = dist; if (l >= maxL) break; }
         cand = prev[cand];
       }
-      WORK.n += visits + 1;
+      WORK.p1 += visits + 1;
     }
     if (bestLen >= 3) {
       litFreq[257 + lenCodeOf(bestLen)]++;
@@ -719,7 +768,10 @@ function greedyFreq(data, off, n) {
   return { litFreq, distFreq };
 }
 // Stream zlib dari optimal-parse; null bila budget kerja habis.
-function optimalZlib(raw) {
+// zlibBestBytes = total byte terbaik jalur zlib (termasuk chunk PLTE/tRNS);
+// dipakai untuk memutuskan apakah pass perbaikan sepadan (hanya bila
+// pass ke-1 sudah menang jelas atas zlib).
+function optimalZlib(raw, zlibBestBytes, chunkOverhead) {
   const w = new BitWriter();
   let bitPos = 0;
   for (let start = 0; start < raw.length; start += P1_BLOCK) {
@@ -736,10 +788,38 @@ function optimalZlib(raw) {
     const f1 = freqsOf(p1);
     const dynLit1 = huffmanLengths(f1.litFreq, 15);
     const dynDist1 = huffmanLengths(f1.distFreq, 15);
-    // Satu pass DP dengan model biaya dinamis (dari greedy); panjang
-    // Huffman final dihitung ulang dari parse DP itu.
+    // Iterasi model ala zopfli: parse ulang dengan panjang Huffman hasil
+    // pass sebelumnya; simpan yang bit-nya paling kecil. Model greedy
+    // pass ke-1 terbukti bias (chain panjang mengubah statistik greedy
+    // sehingga DP mengoptimasi biaya yang salah); iterasi memperbaikinya.
+    // Dijaga budget kerja agar tidak kehabisan di tengah set: pass
+    // tambahan hanya bila gambar besar, pass ke-1 menang jelas atas zlib,
+    // dan kerja P1 masih di bawah cap. (Pass perbaikan HARUS memakai chain
+    // penuh 64: chain 16 terukur tidak memperbaiki apa pun.)
     let ops = p1; let litLen = FIXED_LIT_LEN; let distLen = new Array(30).fill(5);
     if (dynLit1 !== null && dynDist1 !== null) { litLen = dynLit1; distLen = dynDist1; }
+    let bestBits = dataBitsOf(ops, litLen, distLen);
+    let curLit = dynLit1; let curDist = dynDist1;
+    let doRefine = false;
+    if (n >= P1_EXTRA_MIN_BYTES && curLit !== null && curDist !== null && WORK.p1 <= P1_PASS2_CAP) {
+      const fixedEst = 3 + dataBitsOf(ops, FIXED_LIT_LEN, new Array(30).fill(5));
+      const hdrEst = dynamicHeaderBits(litLen, distLen);
+      let dynEst = Infinity;
+      if (hdrEst !== null) dynEst = 3 + hdrEst.bits + dataBitsOf(ops, litLen, distLen);
+      const estBytes = 2 + Math.ceil(Math.min(fixedEst, dynEst) / 8) + 4;
+      if (zlibBestBytes - (estBytes + chunkOverhead) > P1_EXTRA_GAIN_MIN) doRefine = true;
+    }
+    for (let pass = 0; doRefine && pass < P1_EXTRA_PASSES && curLit !== null && curDist !== null && WORK.p1 <= P1_PASS2_CAP; pass++) {
+      const px = parseBlock(raw, start, n, curLit, curDist);
+      if (px === null) break;
+      const fx = freqsOf(px);
+      const dlx = huffmanLengths(fx.litFreq, 15);
+      const ddx = huffmanLengths(fx.distFreq, 15);
+      if (dlx === null || ddx === null) break;
+      const bx = dataBitsOf(px, dlx, ddx);
+      if (bx < bestBits) { bestBits = bx; ops = px; litLen = dlx; distLen = ddx; }
+      curLit = dlx; curDist = ddx;
+    }
     const fixedBits = 3 + dataBitsOf(ops, FIXED_LIT_LEN, new Array(30).fill(5));
     const hdr = dynamicHeaderBits(litLen, distLen);
     let dynBits = Infinity;
@@ -840,8 +920,11 @@ function encodeImage(rgba, w, h) {
     }
   }
   // P1: optimal-parse pada data ter-filter terbaik; pakai hanya bila lebih kecil.
-  if (WORK.n <= P1_WORK_CAP) {
-    const opt = optimalZlib(bestData);
+  // Palet (colour type 3) dilewati: data indeksnya didominasi run panjang
+  // yang sudah optimal di tangan zlib — P1 tidak pernah menang di sana
+  // (terukur 0/2 gambar palet di semua konfigurasi) dan hanya membakar waktu.
+  if (bestForm.ct !== 3 && WORK.p1 <= P1_WORK_CAP) {
+    const opt = optimalZlib(bestData, bestTotal, chunkBytes(bestForm));
     if (opt !== null && opt.length + chunkBytes(bestForm) < bestTotal) bestZlib = opt;
   }
   return pngOfForm(w, h, bestForm, bestZlib);
